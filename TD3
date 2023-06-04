@@ -1,0 +1,278 @@
+import gym
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.distributions import Normal
+
+# DDPG Actor 네트워크
+class Actor(nn.Module):
+    def __init__(self, state_dim, action_dim, max_action):
+        super(Actor, self).__init__()
+        self.fc1 = nn.Linear(state_dim, 400)
+        self.fc2 = nn.Linear(400, 300)
+        self.fc3 = nn.Linear(300, action_dim)
+        self.max_action = max_action
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = torch.tanh(self.fc3(x)) * self.max_action
+        return x
+
+# DDPG Critic 네트워크
+class Critic(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super(Critic, self).__init__()
+        self.fc1 = nn.Linear(state_dim + action_dim, 400)
+        self.fc2 = nn.Linear(400, 300)
+        self.fc3 = nn.Linear(300, 1)
+
+    def forward(self, x, u):
+        x = F.relu(self.fc1(torch.cat([x, u], 1)))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+class ReplayBuffer(object):
+    def __init__(self, state_dim, action_dim, max_size):
+        self.max_size = max_size
+        self.ptr = 0
+        self.size = 0
+        self.state = np.zeros((max_size, state_dim))
+        self.action = np.zeros((max_size, action_dim))
+        self.next_state = np.zeros((max_size, state_dim))
+        self.reward = np.zeros((max_size, 1))
+        self.done = np.zeros((max_size, 1))
+
+    def add(self, state, action, next_state, reward, done):
+        self.state[self.ptr] = state
+        self.action[self.ptr] = action
+        self.next_state[self.ptr] = next_state
+        self.reward[self.ptr] = reward
+        self.done[self.ptr] = done
+        self.ptr = (self.ptr + 1) % self.max_size
+        self.size = min(self.size + 1, self.max_size)
+
+    def sample(self, batch_size):
+        idxs = np.random.randint(0, self.size, size=batch_size)
+        return (
+            self.state[idxs],
+            self.action[idxs],
+            self.next_state[idxs],
+            self.reward[idxs],
+            self.done[idxs]
+        )
+
+class TD3(object):
+    def __init__(
+        self,
+        state_dim,
+        action_dim,
+        max_action,
+        discount=0.99,
+        tau=0.005,
+        policy_noise=0.2,
+        noise_clip=0.5,
+        policy_freq=2
+    ):
+        self.actor = Actor(state_dim, action_dim, max_action)
+        self.actor_target = Actor(state_dim, action_dim, max_action)
+        self.actor_target.load_state_dict(self.actor.state_dict())
+        self.actor_optimizer = optim.Adam(self.actor.parameters())
+
+        self.critic1 = Critic(state_dim, action_dim)
+        self.critic1_target = Critic(state_dim, action_dim)
+        self.critic1_target.load_state_dict(self.critic1.state_dict())
+        self.critic1_optimizer = optim.Adam(self.critic1.parameters())
+
+        self.critic2 = Critic(state_dim, action_dim)
+        self.critic2_target = Critic(state_dim, action_dim)
+        self.critic2_target.load_state_dict(self.critic2.state_dict())
+        self.critic2_optimizer = optim.Adam(self.critic2.parameters())
+
+        self.max_action = max_action
+        self.discount = discount
+        self.tau = tau
+        self.policy_noise = policy_noise
+        self.noise_clip = noise_clip
+        self.policy_freq = policy_freq
+
+        self.total_it = 0
+
+    def select_action(self, state):
+        state = torch.FloatTensor(state.reshape(1, -1))
+        return self.actor(state).cpu().data.numpy().flatten()
+
+    def train(self, replay_buffer, batch_size=100):
+        self.total_it += 1
+
+        # 신경망의 학습
+        state, action, next_state, reward, not_done = replay_buffer.sample(batch_size)
+
+        with torch.no_grad():
+            noise = (torch.randn_like(action) * self.policy_noise).clamp(-self.noise_clip, self.noise_clip)
+            next_action = (self.actor_target(next_state) + noise).clamp(-self.max_action, self.max_action)
+
+            target_Q1 = self.critic1_target(next_state, next_action)
+            target_Q2 = self.critic2_target(next_state, next_action)
+            target_Q = torch.min(target_Q1, target_Q2)
+            target_Q = reward + not_done * self.discount * target_Q
+
+        current_Q1 = self.critic1(state, action)
+        current_Q2 = self.critic2(state, action)
+
+        critic1_loss = F.mse_loss(current_Q1, target_Q)
+        critic2_loss = F.mse_loss(current_Q2, target_Q)
+
+        self.critic1_optimizer.zero_grad()
+        critic1_loss.backward()
+        self.critic1_optimizer.step()
+
+        self.critic2_optimizer.zero_grad()
+        critic2_loss.backward()
+        self.critic2_optimizer.step()
+
+        if self.total_it % self.policy_freq == 0:
+            actor_loss = -self.critic1(state, self.actor(state)).mean()
+
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            self.actor_optimizer.step()
+
+            for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
+                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+
+            for param, target_param in zip(self.critic1.parameters(), self.critic1_target.parameters()):
+                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+
+            for param, target_param in zip(self.critic2.parameters(), self.critic2_target.parameters()):
+                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+
+# DDPG 알고리즘 코드
+class DDPG(object):
+    def __init__(
+        self,
+        state_dim,
+        action_dim,
+        max_action,
+        discount=0.99,
+        tau=0.005,
+        policy_noise=0.2,
+        noise_clip=0.5,
+        policy_freq=2
+    ):
+        self.actor = Actor(state_dim, action_dim, max_action)
+        self.actor_target = Actor(state_dim, action_dim, max_action)
+        self.actor_target.load_state_dict(self.actor.state_dict())
+        self.actor_optimizer = optim.Adam(self.actor.parameters())
+
+        self.critic = Critic(state_dim, action_dim)
+        self.critic_target = Critic(state_dim, action_dim)
+        self.critic_target.load_state_dict(self.critic.state_dict())
+        self.critic_optimizer = optim.Adam(self.critic.parameters())
+
+        self.max_action = max_action
+        self.discount = discount
+        self.tau = tau
+        self.policy_noise = policy_noise
+        self.noise_clip = noise_clip
+        self.policy_freq = policy_freq
+
+        self.total_it = 0
+
+    def select_action(self, state):
+        state = torch.FloatTensor(state.reshape(1, -1))
+        return self.actor(state).cpu().data.numpy().flatten()
+
+    def train(self, replay_buffer, batch_size=100):
+        self.total_it += 1
+
+        # 신경망의 학습
+        state, action, next_state, reward, not_done = replay_buffer.sample(batch_size)
+
+        with torch.no_grad():
+            noise = (torch.randn_like(action) * self.policy_noise).clamp(-self.noise_clip, self.noise_clip)
+            next_action = (self.actor_target(next_state) + noise).clamp(-self.max_action, self.max_action)
+
+            target_Q = self.critic_target(next_state, next_action)
+            target_Q = reward + not_done * self.discount * target_Q
+
+        current_Q = self.critic(state, action)
+
+        critic_loss = F.mse_loss(current_Q, target_Q)
+
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
+
+        actor_loss = -self.critic(state, self.actor(state)).mean()
+
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+
+        for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+
+        for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+
+# Pendulum 환경에서 TD3 알고리즘 훈련
+env = gym.make('Pendulum-v1')
+state_dim = env.observation_space.shape[0]
+action_dim = env.action_space.shape[0]
+max_action = float(env.action_space.high[0])
+
+replay_buffer = ReplayBuffer(state_dim, action_dim)
+td3 = TD3(state_dim, action_dim, max_action)
+
+def train_td3(num_episodes):
+    for episode in range(num_episodes):
+        state = env.reset()
+        episode_reward = 0
+        done = False
+
+        while not done:
+            action = td3.select_action(state)
+            next_state, reward, done, _ = env.step(action)
+            replay_buffer.add(state, action, next_state, reward, float(done))
+            state = next_state
+            episode_reward += reward
+
+            td3.train(replay_buffer)
+
+        print("Episode: {}, Reward: {:.2f}".format(episode, episode_reward))
+
+# Pendulum 환경에서 DDPG 알고리즘 훈련
+env = gym.make('Pendulum-v1')
+state_dim = env.observation_space.shape[0]
+action_dim = env.action_space.shape[0]
+max_action = float(env.action_space.high[0])
+
+replay_buffer = ReplayBuffer(state_dim, action_dim)
+ddpg = DDPG(state_dim, action_dim, max_action)
+
+def train_ddpg(num_episodes):
+    for episode in range(num_episodes):
+        state = env.reset()
+        episode_reward = 0
+        done = False
+
+        while not done:
+            action = ddpg.select_action(state)
+            next_state, reward, done, _ = env.step(action)
+            replay_buffer.add(state, action, next_state, reward, float(done))
+            state = next_state
+            episode_reward += reward
+
+            ddpg.train(replay_buffer)
+
+        print("Episode: {}, Reward: {:.2f}".format(episode, episode_reward))
+
+# TD3 알고리즘 훈련
+train_td3(num_episodes=100)
+
+# DDPG 알고리즘 훈련
+train_ddpg(num_episodes=100)
